@@ -1,0 +1,7 @@
+; $Id$
+name = FileField Podcast Channels
+description = Enhances FileField Podcast by providing channel data which FFPC does not provide.
+package = Views
+core = 6.x
+dependencies[] = ffpc
+

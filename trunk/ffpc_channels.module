@@ -1,0 +1,369 @@
+<?php
+
+/**
+ * @todo support embedded categories
+ * @todo make install file and remove saved variables on uninstall
+ * @todo add dependancy for noderefernce module
+ */
+ 
+/**
+ * Adding some admin settings to ffpc
+ */
+function ffpc_channels_form_alter(&$form, &$form_state, $form_id) {
+  if ($form_id == 'ffpc_admin_settings') {
+    // Adjust the #action to always come back to the ffpc admin form when using ahah
+    $form['#action'] = url('admin/settings/ffpc');
+    
+    // We need the content types to use as form options
+    $content_types = array_keys(content_types());
+    $content_types = array_combine($content_types, $content_types); // Requires PHP5
+        
+    $form['ffpc_channel_settings'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Settings for podcast channels'),
+      '#description' => t('Channel data is pulled from a dedicated content type. In order to reference this channel data, you must use a nodereference field on the podcast content type. The first item, with a valid nodereference, within any View will be used to extract channel data.'),
+      '#prefix' => '<div id="ffpc-channel-settings" class="inline-options">',
+      '#suffix' => '</div>',
+    );
+    $form['ffpc_channel_settings']['ffpc_channel_podcast_type'] = array(
+      '#type' => 'select',
+      '#title' => t('Podcast content type'),
+      '#description' => t("Select the content type which you're using for the podcasts."),
+      '#default_value' => variable_get('ffpc_channel_podcast_type', FALSE),
+      '#options' => !variable_get('ffpc_channel_podcast_type', FALSE) ? array_merge(array( 0 => t('- Not set -')), $content_types) : $content_types,
+      '#ahah' => array(
+        'path' => 'admin/settings/ffpc/ffpc_channels/update_fields',
+        'wrapper' => 'ffpc-channel-settings',
+        'event' => 'change',
+      ),
+    );
+
+    // Grab the podcast content type - user may have changed it (ahah triggered on selection)
+    $podcast_type = isset($form_state['values']['ffpc_channel_podcast_type']) ? $form_state['values']['ffpc_channel_podcast_type'] : variable_get('ffpc_channel_podcast_type', FALSE);
+
+    if (!empty($podcast_type)) {
+      $form['ffpc_channel_settings']['ffpc_channel_reference_field'] = array(
+        '#type' => 'select',
+        '#title' => t('Node reference field'),
+        '#description' => t('Specify the nodereference field which points to the channel node (from the podcast item).'),
+        '#default_value' => variable_get('ffpc_channel_reference_field','None found'),
+        '#options' => ffpc_channels_nodereference_fields($podcast_type),
+      );
+    
+      $form['ffpc_channel_settings']['ffpc_channel_channel_type'] = array(
+        '#type' => 'select',
+        '#title' => t('Channel content type'),
+        '#description' => t("Select the content type which you're using for channel information."),
+        '#default_value' => variable_get('ffpc_channel_channel_type', FALSE),
+        '#options' => !variable_get('ffpc_channel_channel_type', FALSE) ? array_merge(array( 0 => t('- Not set -')), $content_types) : $content_types,
+        '#ahah' => array(
+          'path' => 'admin/settings/ffpc/ffpc_channels/update_fields',
+          'wrapper' => 'ffpc-channel-settings',
+          'event' => 'change',
+        ),
+      );
+    
+      // Grab the channel content type - user may have changed it (ahah triggered on selection)
+      $channel_type = isset($form_state['values']['ffpc_channel_channel_type']) ? $form_state['values']['ffpc_channel_channel_type'] : variable_get('ffpc_channel_channel_type', FALSE);
+      $channel_map = variable_get('ffpc_channel_channel_tags', array());
+      if (!empty($channel_type) && variable_get('ffpc_channel_reference_field', FALSE)) {
+        foreach (ffpc_channels_itunes_tags() as $tag => $name) {
+          $form['ffpc_channel_settings']['ffpc_channel_channel_tags']['channel_tag_'. str_replace(' ', '_', $name)] = array(
+            '#type' => 'select',
+            '#title' => t('Channel tag for ') . $name,
+            '#default_value' => empty($channel_map[$tag]) ? array( 0 => "Not set") : $channel_map[$tag],
+            '#options' => array_merge(
+                                    array(
+                                      0 => "Not set", // Default when not set
+                                      'node_title' => 'node_title', // Specials come from the node (title, path & body)
+                                      'node_path' => 'node_path',
+                                      'node_body' => 'node_body'
+                                    ), ffpc_channels_content_fields($channel_type)),
+          );
+        }
+      }
+    }
+    // Make sure buttons on admin form are at bottom
+    $form[buttons]['#weight'] = 10;
+    // Add our own submit handler for setting the tag>>field mapping variable
+    $form['#submit'][] = 'ffpc_channels_form_submit';
+  }
+}
+
+/**
+ * Submit handler for channel field mapping.
+ * Tags are mapped to content fields within a variable named ffpc_channel_channel_tags
+ * On the form they are identified by the initial key of "ffpc_channel_tag_"
+ */
+function ffpc_channels_form_submit($form, &$form_state) {
+  // Will store the tag >> field map for storage in  the variable
+  $channel_map = array();
+  $itunes_keys = ffpc_channels_itunes_tags();
+  // Strip the "ffpc_channel_tag_" and create the lookup value
+  foreach ($form_state['values'] as $key => $field) {
+    $lookup = str_replace("channel_tag_", '', $key);
+    $lookup = str_replace("_", " ", $lookup); // Put spaces back into value (e.g. new_feed_url >> new feed url)
+    $tag = array_search($lookup, $itunes_keys);
+    if ($tag) {
+      $channel_map[$tag] = check_plain($field);
+    }
+  }
+  // Set the variable to the tag>>field map - will be used when processing topmost node of view
+  variable_set('ffpc_channel_channel_tags', $channel_map);
+}
+
+/**
+ * Helper function which returns only nodereference field types.
+ */
+function ffpc_channels_nodereference_fields($content_type) {
+  $options = array();
+  $info = content_types($content_type);
+  $fields = $info['fields'];
+  foreach ($fields as $name => $settings) {
+    if ($settings['type'] == 'nodereference') {
+      $options[$name] = $name;
+    }
+  }
+
+  return empty($options) ? array( 0 => t('None found')) : $options;
+}
+
+/**
+ * Helper function to get fields of a specific content type. (couldn't find helper in content.module)
+ * returns a keyed array using the field name for key and value, otherwise false
+ */
+function ffpc_channels_content_fields($content_type) {
+  $info = content_types($content_type);
+  $fields = array_keys($info['fields']);
+  return array_combine($fields, $fields); // Requires PHP5 - could use drupal_map_assoc()
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function ffpc_channels_menu() {
+  $items['admin/settings/ffpc/ffpc_channels/update_fields'] = array(
+    'title' => 'Javascript Channel Field',
+    'page callback' => 'ffpc_channels_reference_field_js',
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}
+
+/**
+ * JS callback method to return new listing field listing.
+ * This function is called when "Channel content type" is changed.
+ * @todo fix message settings based on multiple user selections from ahah select
+ */
+function ffpc_channels_reference_field_js() {
+  // Rebuild the form so it isn't submitted
+  $form_state = array('storage' => NULL, 'submitted' => FALSE, 'rebuild' => FALSE);
+  $form_build_id = $_POST['form_build_id'];
+  // Get form from cache
+  $form = form_get_cache($form_build_id, $form_state);
+  $args = $form['#parameters'];
+  $form_id = array_shift($args);
+  $form_state['post'] = $form['#post'] = $_POST;
+  $form['#programmed'] = $form['#redirect'] = FALSE;
+  drupal_process_form($form_id, $form, $form_state);
+  // Rebuild the form and cache it again.
+  $form = drupal_rebuild_form($form_id, $form_state, $args, $form_build_id);
+  // Here's the magic, just get the part of the form you deal with
+  $ffpc_channel = $form['ffpc_channel_settings'];
+  // Build the HTML output.
+  $output = drupal_render($ffpc_channel);
+  drupal_json(array('status' => TRUE, 'data' => $output));
+  exit;
+}
+
+/**
+ * Helper function for iTunes channel tags.
+ * http://www.apple.com/itunes/whatson/podcasts/specs.html
+ */
+function ffpc_channels_itunes_tags(){
+  return array(
+    'title' => 'title',
+    'link' => 'link',
+    'description' => 'description',
+    'copyright' => 'copyright',
+    'itunes:author' => 'author',
+    'itunes:category' => 'category',
+    'itunes:image' => 'image',
+    'itunes:explicit' => 'explicit',
+    'itunes:keywords' => 'keywords',
+    'itunes:new-feed-url' => 'new feed url',
+    'itunes:name' => 'owner', // Order is itunes:owner > itunes:name > itunes:email
+    'itunes:email' => 'email',
+    'itunes:subtitle' => 'subtitle',
+    'itunes:summary' => 'summary',
+    );
+}
+
+/**
+ * Implementation of hook_ffpc_channel().
+ *
+ * This function will pull the first node of the resulting
+ * $view. If the view has a node reference field and is
+ * pointing to a matching (valid) content type then channel
+ * data is updated with info from that node
+ */
+function ffpc_channels_ffpc_channel(&$channel, &$view){
+  // Adding channel elements to the podcast.
+  // Pulling extra channel data from the first $view result record
+  $first_view_node = $view->result[0];
+  if (!empty($first_view_node)) {
+    $node = node_load($first_view_node->nid); // Temporarily load the topmost $view node
+    $nodereference = variable_get('ffpc_channel_reference_field', FALSE);
+    $channel_node = $node->$nodereference;
+    $channel_node = $channel_node[0]['nid'];
+    unset($node);
+    if ($node = node_load($channel_node)) {
+      $channel_map = variable_get('ffpc_channel_channel_tags', array());
+      // Extract any field values into the channel
+      foreach ($channel_map as $tag => $field) {
+        if (!empty($field)) {
+          // Get the value from the node's field
+          $value = $node->$field;
+          $value = $value[0]['value'];
+          switch ($tag) {
+            case 'title':
+              $channel->title = ($field == 'node_title') ? $node->title : $value;
+              break;
+    
+            case 'link':
+              $channel->link = ($field == 'node_path') ? url($node->path, array('absolute' => TRUE)) : $value;
+              break;
+    
+            case 'description':
+              $channel->description = ($field == 'node_body') ? $node->body : $value;
+              break;
+    
+            case 'itunes:image': // Special handling needed for images tag
+              if (!empty($field)) {
+                // Using a numeric key for format_xml_elements() to insert href attribute
+                $image = $node->$field;
+                $path = url($image[0]['filepath'], array('absolute' => TRUE));
+                $channel->args[count($channel->args) + 1] = array('key' => $tag, 'attributes' => array( 'href' => $path));
+              }
+              break;
+    
+            default:
+              if (!empty($value)) {
+                $channel->args[$tag] = $value;
+              }
+              break;
+          }
+        }
+      }
+    }
+  }
+  // Account for owner name and email and fix the structure
+  if (isset($channel->args['itunes:name'])) {
+    $channel->args['itunes:owner']['itunes:name'] = $channel->args['itunes:name'];
+    unset($channel->args['itunes:name']);
+  }
+  if (isset($channel->args['itunes:email'])) {
+    $channel->args['itunes:owner']['itunes:email'] = $channel->args['itunes:email'];
+    unset($channel->args['itunes:email']);
+  }
+}
+
+/**
+ * Helper function for providing category options on channel nodes.
+ * returns a keyed array of category options suitable for select lists
+ * @todo make the itunes categories into a cck widget
+ */
+function ffpc_channels_itunes_categories(){
+  // Thanks to the iTunes module for this formatted array
+  $categories =  array(
+    'Arts' => array(
+      'Design',
+      'Fashion & Beauty',
+      'Food',
+      'Literature',
+      'Performing Arts',
+      'Visual Arts',
+    ),
+    'Business' => array(
+      'Business News',
+      'Careers',
+      'Investing',
+      'Management & Marketing',
+      'Shopping',
+    ),
+    'Comedy' => array(),
+    'Education' => array(
+      'Education Technology',
+      'Higher Education',
+      'K-12',
+      'Language Courses',
+      'Training',
+    ),
+    'Games & Hobbies' => array(
+      'Automotive',
+      'Aviation',
+      'Hobbies',
+      'Other Games',
+      'Video Games',
+    ),
+    'Government & Organizations' => array(
+      'Local',
+      'National',
+      'Non-Profit',
+      'Regional',
+    ),
+    'Health' => array(
+      'Alternative Health',
+      'Fitness & Nutrition',
+      'Self-Help',
+      'Sexuality',
+    ),
+    'Kids & Family' => array(),
+    'Music' => array(),
+    'News & Politics' => array(),
+    'Religion & Spirituality' => array(
+      'Buddhism',
+      'Christianity',
+      'Hinduism',
+      'Islam',
+      'Judaism',
+      'Other',
+      'Spirituality',
+    ),
+    'Science & Medicine' => array(
+      'Medicine',
+      'Natural Sciences',
+      'Social Sciences',
+    ),
+    'Society & Culture' => array(
+      'History',
+      'Personal Journals',
+      'Philosophy',
+      'Places & Travel',
+    ),
+    'Sports & Recreation' => array(
+      'Amateur',
+      'College & High School',
+      'Outdoor',
+      'Professional',
+    ),
+    'Technology' => array(
+      'Gadgets',
+      'Tech News',
+      'Podcasting',
+      'Software How-To',
+    ),
+    'TV & Film' => array(),
+  );
+
+  $options = array();
+  foreach ($categories as $main => $subcategories) {
+    $options[$main] = $main;
+    foreach ($subcategories as $name) {
+      $options[$main .'|'. $name] = "$main > $name";
+    }
+  }
+
+  return $options;
+}
